@@ -308,6 +308,7 @@ def jax_multiplatform_test(
             tags = test_tags,
             main = main,
             exec_properties = tf_exec_properties({"tags": test_tags}),
+            visibility = jax_visibility(name),
         )
 
 def jax_generate_backend_suites(backends = []):
@@ -322,10 +323,12 @@ def jax_generate_backend_suites(backends = []):
         native.test_suite(
             name = "%s_tests" % backend,
             tags = ["jax_test_%s" % backend, "-manual"],
+            visibility = ["//visibility:public"],
         )
     native.test_suite(
         name = "backend_independent_tests",
         tags = ["-jax_test_%s" % backend for backend in backends] + ["-manual"],
+        visibility = ["//visibility:public"],
     )
 
 def _get_full_wheel_name(
@@ -646,7 +649,7 @@ def wheel_sources(
         ":{}_py".format(name),
         ":{}_data".format(name),
         ":{}_hdrs".format(name),
-    ] + static_srcs)
+    ] + static_srcs, visibility = ["//visibility:public"])
 
 def if_pypi_cuda_wheel_deps(if_true, if_false = []):
     """ select() on whether we're adding pypi CUDA wheel deps. """
@@ -709,3 +712,198 @@ def jax_multiprocess_test(
 
 def jax_multiprocess_generate_backend_suites(name = None, backends = []):
     return jax_generate_backend_suites(backends = backends)
+
+WheelAdditivesInfo = provider(
+    "Provider to collect files from test dependencies",
+    fields = {"wheel_additives": "depset of files"},
+)
+
+def _collect_wheel_additives_aspect_impl(_, ctx):
+    wheel_additives = []
+    if hasattr(ctx.rule.attr, "srcs"):
+        attr_val = getattr(ctx.rule.attr, "srcs")
+        if type(attr_val) == "list":
+            for dep in attr_val:
+                transitive_sources = {}
+                for ts in dep[DefaultInfo].files.to_list():
+                    transitive_sources[ts] = True
+                if PyInfo in dep:
+                    for ts in dep[PyInfo].transitive_sources.to_list():
+                        if not ("site-packages/" in ts.path or ts.path.endswith("_test.py")):
+                            transitive_sources[ts] = True
+                wheel_additives.append(depset(transitive_sources.keys()))
+    return [WheelAdditivesInfo(wheel_additives = depset(transitive = wheel_additives))]
+
+collect_wheel_additives_aspect = aspect(
+    implementation = _collect_wheel_additives_aspect_impl,
+    attr_aspects = ["srcs"],
+)
+
+TestDepsInfo = provider(
+    "Provider to collect files from test dependencies",
+    fields = {"test_dependencies": "depset of files"},
+)
+
+def _collect_test_dependencies_aspect_impl(_, ctx):
+    test_deps = []
+
+    # Collect files from the 'data' attribute of the current target, if it exists.
+    #if hasattr(ctx.rule.attr, "data"):
+    #    for item in ctx.rule.attr.data:
+    #        if DefaultInfo in item:
+    #            data_deps.item[DefaultInfo].files)
+
+    # Attributes to traverse to find more dependencies.
+    attrs_to_traverse = []
+    if ctx.rule.kind == "test_suite":
+        attrs_to_traverse.append("_implicit_tests")
+    else:
+        #    fail(ctx.rule.attr)
+        #    # For other rules like py_test, py_library, etc.,
+        #    # 'deps' and 'data' are common places for further dependencies.
+        if hasattr(ctx.rule.attr, "deps"):
+            attrs_to_traverse.append("deps")
+
+    #    # 'data' can also contain labels, so we check deps from there too.
+    #    if hasattr(ctx.rule.attr, "data"):
+    #         attrs_to_traverse.append("data")
+
+    for attr_name in attrs_to_traverse:
+        if hasattr(ctx.rule.attr, attr_name):
+            attr_val = getattr(ctx.rule.attr, attr_name)
+            if type(attr_val) == "list":
+                for dep in attr_val:
+                    transitive_sources = {}
+
+                    # The last file in the transitive sources is the actual test file
+                    for ts in dep[PyInfo].transitive_sources.to_list()[:-1]:
+                        if not ("site-packages/" in ts.path):
+                            transitive_sources[ts] = True
+                    test_deps.append(depset(transitive_sources.keys()))
+
+            #elif type(attr_val) == "Target":
+            #     if DataFilesInfo in attr_val:
+            #        data_deps.append(attr_val[DataFilesInfo].data_files)
+
+    return [TestDepsInfo(test_dependencies = depset(transitive = test_deps))]
+
+collect_test_dependencies_aspect = aspect(
+    implementation = _collect_test_dependencies_aspect_impl,
+    attr_aspects = ["tests"],
+)
+
+def _compare_wheel_sources_and_test_dependencies_test_impl(ctx):
+    build_jaxlib = ctx.attr.build_jaxlib[BuildSettingInfo].value
+    build_jax = ctx.attr.build_jax[BuildSettingInfo].value
+    message = "PASSED: All test dependencies are present in the wheel."
+    test_result = 0
+    doc_link = "https://github.com/jax-ml/jax/blob/main/docs/contributing.md#wheel-sources-update"
+
+    if build_jax == "true" and build_jaxlib == "true":
+        wheel_sources_map = {
+            f.short_path: True
+            for f in ctx.files.wheel_sources
+            if not "site-packages/" in f.short_path
+        }
+
+        wheel_additives_list = []
+        for additive in ctx.attr.wheel_additives:
+            if WheelAdditivesInfo in additive:
+                wheel_additives_list.append(additive[WheelAdditivesInfo].wheel_additives)
+
+        wheel_additives_depset = depset(transitive = wheel_additives_list)
+        wheel_sources_map = wheel_sources_map | {
+            f.short_path: True
+            for f in wheel_additives_depset.to_list()
+        }
+
+        test_dependencies_list = []
+        for test in ctx.attr.tests:
+            if TestDepsInfo in test:
+                test_dependencies_list.append(test[TestDepsInfo].test_dependencies)
+
+        test_dependencies_depset = depset(transitive = test_dependencies_list)
+        test_dependencies_map = {}
+
+        # We need to add __init__.py files for all python modules to make them available via API
+        for f in test_dependencies_depset.to_list():
+            test_dependencies_map[f.short_path] = True
+            init_py_path = f.short_path.replace(f.basename, "__init__.py")
+            if f.short_path.startswith("jax") and init_py_path not in ctx.attr.ignored_init_py_files:
+                test_dependencies_map[init_py_path] = True
+
+        test_dependencies_paths = [k for k in test_dependencies_map.keys()]
+        wheel_sources_paths = wheel_sources_map.keys()
+
+        if wheel_sources_paths != test_dependencies_paths:
+            missing_in_wheel_sources = sorted([
+                p
+                for p in test_dependencies_paths
+                if p not in wheel_sources_map
+            ])
+
+            #extra_in_wheel_sources = sorted([p for p in wheel_sources_paths if p not in test_dependencies_map])
+            if missing_in_wheel_sources:
+                message = ("FAILED: Files in test dependencies not found in wheel sources: %s" %
+                           missing_in_wheel_sources + "\n" +
+                           "See instructions in %s" % doc_link)
+                test_result = 1
+
+            #if extra_in_wheel_sources:
+            #    message = "  Files in wheel sources not found in test dependencies: %s\n" % extra_in_wheel_sources
+            # fail(message)
+
+    else:
+        message = "SKIPPED: The test will be executed only with //jax:build_jax=true and //jax:build_jaxlib=true."
+        test_result = 0
+
+    script_content = """#!/bin/bash
+echo "%s"
+exit %s""" % (message, test_result)
+    test_runner_script = ctx.actions.declare_file(ctx.label.name + "_runner.sh")
+    ctx.actions.write(
+        output = test_runner_script,
+        content = script_content,
+        is_executable = True,
+    )
+
+    runfiles = ctx.runfiles(files = [])
+
+    return [
+        DefaultInfo(
+            executable = test_runner_script,
+            runfiles = runfiles,
+        ),
+    ]
+
+compare_wheel_sources_and_test_dependencies_test = rule(
+    implementation = _compare_wheel_sources_and_test_dependencies_test_impl,
+    attrs = {
+        "wheel_sources": attr.label_list(
+            allow_files = True,
+            mandatory = True,
+        ),
+        "wheel_additives": attr.label_list(
+            allow_files = True,
+            mandatory = True,
+            aspects = [collect_wheel_additives_aspect],
+        ),
+        "tests": attr.label_list(
+            allow_empty = False,
+            mandatory = True,
+            aspects = [collect_test_dependencies_aspect],
+        ),
+        "ignored_init_py_files": attr.string_list(default = [
+            "jaxlib/__init__.py",
+            # These files are not included in the JAX wheel because they belong to LLVM.
+            "jaxlib/mlir/__init__.py",
+            "jaxlib/mlir/dialects/__init__.py",
+            "jaxlib/mlir/extras/__init__.py",
+            "jaxlib/mosaic/dialect/gpu/__init__.py",
+            "jaxlib/mosaic/python/__init__.py",
+        ]),
+        "build_jaxlib": attr.label(default = Label("//jax:build_jaxlib")),
+        "build_jax": attr.label(default = Label("//jax:build_jax")),
+    },
+    test = True,
+)
